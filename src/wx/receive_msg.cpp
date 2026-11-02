@@ -122,7 +122,7 @@ struct RawMsg {
     char     wxid[512];
     char     sender[512];
     char     source[512];
-    char     content[2048];
+    char     content[65536];  // 扩容至 64KB，完整容纳公众号多图文 XML（<mmreader>）
     char     filepath[1024];
     bool     ok;
     bool     skip;  // WxSysSyncMsg 静默跳过
@@ -314,14 +314,18 @@ void __stdcall OnRecvMessageFromStack(DWORD msg_base)
 {
     if (!ProbeMsgBase(msg_base)) return;
 
-    RawMsg raw;
-    if (!ReadRawMsgPod(msg_base, raw)) {
-        if (raw.skip) return;  // WxSysSyncMsg 静默跳过
+    // RawMsg 含 64KB 缓冲，采用堆分配避免撑爆微信回调线程栈
+    RawMsg* raw = new RawMsg();
+    if (!ReadRawMsgPod(msg_base, *raw)) {
+        bool skip = raw->skip;
+        delete raw;
+        if (skip) return;  // WxSysSyncMsg 静默跳过
         PostLogAsync("接收消息: 读取原始字段失败 (SEH 捕获)");
         return;
     }
 
-    ProcessParsedMsg(raw);
+    ProcessParsedMsg(*raw);
+    delete raw;
 }
 
 // ---------- __declspec(naked) 跳板：保存现场 -> 调 C++ 处理 -> ----------

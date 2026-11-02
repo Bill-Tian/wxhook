@@ -1,0 +1,41 @@
+name: Build wxhook DLL (x86)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        configuration: [Debug, Release]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build wxhook.dll (Win32 / x86)
+        run: |
+          msbuild wxhook.sln `
+            /p:Configuration=${{ matrix.configuration }} `
+            /p:Platform=x86 `
+            /p:PlatformToolset=v143 `
+            /m
+
+      - name: Upload Artifact (${{ matrix.configuration }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: wxhook-x86-${{ matrix.configuration }}
+          path: |
+            ${{ matrix.configuration }}/wxhook.dll
+            WxTools.exe
+            tools/receiver.py
+          if-no-files-found: error
+
