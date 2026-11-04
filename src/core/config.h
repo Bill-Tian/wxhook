@@ -9,7 +9,7 @@ static constexpr const char* HTTP_HOST = "0.0.0.0";
 static constexpr int  HTTP_PORT = 8888;
 
 // 期望的微信版本，格式：主.次.构建.修订
-static constexpr const char* EXPECTED_WX_VERSION = "3.9.12.56";
+static constexpr const char* EXPECTED_WX_VERSION = "3.9.12.57";
 
 // 外部 /log 接收端（DLL 通过 HTTP POST 上报异常/关键事件至此）
 static constexpr const char* LOG_HOST = "127.0.0.1";

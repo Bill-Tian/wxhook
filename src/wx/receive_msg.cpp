@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "receive_msg.h"
-#include "wechat.h"          // GetWeChatWinBase / WideToUtf8
+#include "wechat.h"          // GetWeChatWinBase / AllocTrampolineNear / WideToUtf8
 #include "http_client.h"     // PostLog / PostJson
 #include "config.h"          // cfg::MSG_*
 #include "image_decoder.h"   // DecodeImageAsync（图片落盘解密）
@@ -9,71 +9,76 @@
 
 #include <string>
 #include <cstring>
+#include <cstdint>
 
 using json = nlohmann::json;
 
 namespace {
 
 // Hook 运行状态 & 被覆盖指令的备份
-static bool  g_installed = false;
-static DWORD g_target_addr = 0;     // GetWeChatWinBase() + WxReciveMessage
-static DWORD g_over_call_addr = 0;  // GetWeChatWinBase() + WxReciveMessageCall
-static DWORD g_ret_addr = 0;        // g_target_addr + 5
-static BYTE  g_orig_bytes[16] = {0};// 被覆盖的原指令备份（前 5 字节）
+static bool      g_installed      = false;
+static uintptr_t g_target_addr    = 0;     // GetWeChatWinBase() + WxReciveMessage
+static uintptr_t g_over_call_addr = 0;     // GetWeChatWinBase() + WxReciveMessageCall
+static uintptr_t g_ret_addr       = 0;     // g_target_addr + 5
+static void*     g_trampoline     = nullptr;
+static BYTE      g_orig_bytes[16] = {0};   // 被覆盖的原指令备份（前 5 字节）
 
 // ---------- inline hook 底层：修改目标入口的 5 字节为 JMP rel32 ----------
-static bool Write5ByteJump(DWORD target, DWORD to)
+static bool Write5ByteJump(uintptr_t target, uintptr_t to)
 {
     if (!target || !to) return false;
+    intptr_t rel = static_cast<intptr_t>(to) - static_cast<intptr_t>(target) - 5;
+    if (rel < INT32_MIN || rel > INT32_MAX) return false;
+
     DWORD old_protect = 0;
-    if (!VirtualProtect((LPVOID)target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
+    if (!VirtualProtect(reinterpret_cast<LPVOID>(target), 5, PAGE_EXECUTE_READWRITE, &old_protect))
         return false;
     if (g_orig_bytes[0] == 0 && g_orig_bytes[1] == 0 &&
         g_orig_bytes[2] == 0 && g_orig_bytes[3] == 0 && g_orig_bytes[4] == 0) {
-        memcpy(g_orig_bytes, (LPCVOID)target, 5);
+        memcpy(g_orig_bytes, reinterpret_cast<LPCVOID>(target), 5);
     }
-    BYTE* p = (BYTE*)target;
+    BYTE* p = reinterpret_cast<BYTE*>(target);
     p[0] = 0xE9;  // JMP rel32
-    *(DWORD*)(&p[1]) = to - target - 5;
-    FlushInstructionCache(GetCurrentProcess(), (LPCVOID)target, 5);
-    VirtualProtect((LPVOID)target, 5, old_protect, &old_protect);
+    *reinterpret_cast<int32_t*>(&p[1]) = static_cast<int32_t>(rel);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<LPCVOID>(target), 5);
+    VirtualProtect(reinterpret_cast<LPVOID>(target), 5, old_protect, &old_protect);
     return true;
 }
 
-static bool Restore5ByteJump(DWORD target)
+static bool Restore5ByteJump(uintptr_t target)
 {
     if (!target) return false;
     DWORD old_protect = 0;
-    if (!VirtualProtect((LPVOID)target, 5, PAGE_EXECUTE_READWRITE, &old_protect))
+    if (!VirtualProtect(reinterpret_cast<LPVOID>(target), 5, PAGE_EXECUTE_READWRITE, &old_protect))
         return false;
-    memcpy((LPVOID)target, g_orig_bytes, 5);
-    FlushInstructionCache(GetCurrentProcess(), (LPCVOID)target, 5);
-    VirtualProtect((LPVOID)target, 5, old_protect, &old_protect);
+    memcpy(reinterpret_cast<LPVOID>(target), g_orig_bytes, 5);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<LPCVOID>(target), 5);
+    VirtualProtect(reinterpret_cast<LPVOID>(target), 5, old_protect, &old_protect);
     return true;
 }
 
 // ---------- 微信结构解析辅助：纯 SEH，不引入任何 C++ 对象（避免 C2712） ----------
-static DWORD SafeReadDwordPtr(DWORD addr)
+static uintptr_t SafeReadPtr(uintptr_t addr)
 {
     if (!addr) return 0;
-    DWORD ptr = 0;
+    uintptr_t ptr = 0;
     __try {
-        ptr = *(DWORD*)addr;
+        ptr = *reinterpret_cast<uintptr_t*>(addr);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
     return ptr;
 }
 
-static const wchar_t* SafeReadWxWideCharPtr(DWORD addr)
+static const wchar_t* SafeReadWxWideCharPtr(uintptr_t addr)
 {
     if (!addr) return nullptr;
-    DWORD ptr = SafeReadDwordPtr(addr);
+    uintptr_t ptr = SafeReadPtr(addr);
     if (!ptr) return nullptr;
     const wchar_t* w = nullptr;
     __try {
-        w = (const wchar_t*)ptr;
-        (void)w[0];  // 探测一下可访问性
+        w = reinterpret_cast<const wchar_t*>(ptr);
+        (void)w[0];  // 探测可访问性
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
     }
@@ -94,7 +99,7 @@ static bool WideToUtf8Buf(const wchar_t* w, char* out, size_t out_size)
     return true;
 }
 
-static bool SafeReadWxWideToUtf8Buf(DWORD addr, char* out_buf, size_t buf_size)
+static bool SafeReadWxWideToUtf8Buf(uintptr_t addr, char* out_buf, size_t buf_size)
 {
     const wchar_t* w = SafeReadWxWideCharPtr(addr);
     return WideToUtf8Buf(w, out_buf, buf_size);
@@ -129,15 +134,15 @@ struct RawMsg {
 };
 
 // 本函数只包含 POD + __try，绝不引入 std::string 等有析构的对象（强制规避 C2712）
-static bool ReadRawMsgPod(DWORD msg_base, RawMsg& raw)
+static bool ReadRawMsgPod(uintptr_t msg_base, RawMsg& raw)
 {
     if (!msg_base) return false;
     memset(&raw, 0, sizeof(raw));
 
     __try {
-        raw.msgtype    = *(int*)(msg_base + MsgTypeOffset);
-        raw.isphonemsg = *(int*)(msg_base + IsPhoneMsg);
-        raw.msgid      = *(uint64_t*)(msg_base + 0x30);
+        raw.msgtype    = *reinterpret_cast<int*>(msg_base + MsgTypeOffset);
+        raw.isphonemsg = *reinterpret_cast<int*>(msg_base + IsPhoneMsg);
+        raw.msgid      = *reinterpret_cast<uint64_t*>(msg_base + MsgIdOffset);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -186,13 +191,13 @@ static bool ReadRawMsgPod(DWORD msg_base, RawMsg& raw)
 }
 
 // 访问性预检：独立小函数，纯 __try，无 C++ 对象
-static bool ProbeMsgBase(DWORD msg_base)
+static bool ProbeMsgBase(uintptr_t msg_base)
 {
     if (!msg_base) return false;
     __try {
-        (void)*(volatile DWORD*)(msg_base + MsgTypeOffset);
-        (void)*(volatile DWORD*)(msg_base + MsgContentOffset);
-        (void)*(volatile DWORD*)(msg_base + WxidOffset);
+        (void)*reinterpret_cast<volatile DWORD*>(msg_base + MsgTypeOffset);
+        (void)*reinterpret_cast<volatile uintptr_t*>(msg_base + MsgContentOffset);
+        (void)*reinterpret_cast<volatile uintptr_t*>(msg_base + WxidOffset);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -266,15 +271,13 @@ static void DispatchMsgAsync(PostMsgParam* param)
 }
 
 // 封装 std::string + DispatchMsgAsync：无 __try，可安心使用 C++ 对象
-// 注意：本函数跑在微信消息接收回调线程上，绝不碰任何网络 I/O
-// （PostLog/PostJson 全部在 PostMsgThread 异步线程里做）
 static void ProcessParsedMsg(const RawMsg& raw)
 {
     PostMsgParam* out = new PostMsgParam();
     out->msgtype     = raw.msgtype;
     out->isphonemsg  = raw.isphonemsg;
     out->msgid       = raw.msgid;
-    out->wxid        = raw.wxid[0]     ? raw.wxid     : std::string("NULL");
+    out->wxid        = raw.wxid[0] ? raw.wxid : std::string("NULL");
     out->sender      = raw.sender;
     out->source      = raw.source;
     out->content     = raw.content;
@@ -307,10 +310,9 @@ static void PostLogAsync(const char* msg)
     else   delete p;
 }
 
-// __stdcall 回调：本函数**不包含任何** __try / __except（避免对象展开冲突 C2712）
-// 所有 SEH 操作都在独立的 POD 小函数里完成
-// 本函数跑在微信消息接收回调线程上，绝不碰任何网络 I/O
-void __stdcall OnRecvMessageFromStack(DWORD msg_base)
+// x64 __fastcall 回调：RCX = ChatMsg* (msg_base)
+// 本函数不包含任何 __try / __except（避免对象展开冲突 C2712）
+void __fastcall OnRecvMessageFromStack(uintptr_t msg_base)
 {
     if (!ProbeMsgBase(msg_base)) return;
 
@@ -328,18 +330,50 @@ void __stdcall OnRecvMessageFromStack(DWORD msg_base)
     delete raw;
 }
 
-// ---------- __declspec(naked) 跳板：保存现场 -> 调 C++ 处理 -> ----------
-// ---------- 调用被覆盖 call -> 跳到返回地址                     ----------
-__declspec(naked) void RecvMessageTrampoline()
+// 构建 x64 机器码跳板：
+// 1. push rcx; sub rsp, 0x28 (保持 16 字节栈对齐 + 32 字节 Shadow Space)
+// 2. movabs rax, OnRecvMessageFromStack; call rax
+// 3. add rsp, 0x28; pop rcx
+// 4. movabs rax, g_over_call_addr; call rax (执行被覆盖的 ChatMsg::~ChatMsg)
+// 5. movabs rax, g_ret_addr; jmp rax        (跳回原指令 + 5)
+static bool BuildRecvMessageTrampoline()
 {
-    __asm {
-        PUSHAD
-        PUSH    ECX                     // ECX = msg 结构指针（参考示例 PUSH ECX）
-        CALL    OnRecvMessageFromStack
-        POPAD
-        CALL    [g_over_call_addr]      // 调用被覆盖的 call（WxReciveMessageCall）
-        JMP     [g_ret_addr]            // 跳回原函数入口 + 5
+    if (!g_trampoline) {
+        g_trampoline = AllocTrampolineNear(g_target_addr, 64);
+        if (!g_trampoline) return false;
     }
+
+    uint8_t code[48] = {};
+    size_t i = 0;
+
+    // push rcx
+    code[i++] = 0x51;
+    // sub rsp, 0x28
+    code[i++] = 0x48; code[i++] = 0x83; code[i++] = 0xEC; code[i++] = 0x28;
+    // movabs rax, OnRecvMessageFromStack
+    code[i++] = 0x48; code[i++] = 0xB8;
+    uintptr_t fn_addr = reinterpret_cast<uintptr_t>(&OnRecvMessageFromStack);
+    memcpy(&code[i], &fn_addr, 8); i += 8;
+    // call rax
+    code[i++] = 0xFF; code[i++] = 0xD0;
+    // add rsp, 0x28
+    code[i++] = 0x48; code[i++] = 0x83; code[i++] = 0xC4; code[i++] = 0x28;
+    // pop rcx
+    code[i++] = 0x59;
+    // movabs rax, g_over_call_addr
+    code[i++] = 0x48; code[i++] = 0xB8;
+    memcpy(&code[i], &g_over_call_addr, 8); i += 8;
+    // call rax
+    code[i++] = 0xFF; code[i++] = 0xD0;
+    // movabs rax, g_ret_addr
+    code[i++] = 0x48; code[i++] = 0xB8;
+    memcpy(&code[i], &g_ret_addr, 8); i += 8;
+    // jmp rax
+    code[i++] = 0xFF; code[i++] = 0xE0;
+
+    memcpy(g_trampoline, code, i);
+    FlushInstructionCache(GetCurrentProcess(), g_trampoline, i);
+    return true;
 }
 
 } // namespace
@@ -349,7 +383,7 @@ bool InstallReceiveMessageHook()
 {
     if (g_installed) return true;
 
-    DWORD base = GetWeChatWinBase();
+    uintptr_t base = GetWeChatWinBase();
     if (!base) {
         PostLog("接收消息 Hook: 无法获取 WeChatWin 基址");
         return false;
@@ -358,7 +392,12 @@ bool InstallReceiveMessageHook()
     g_over_call_addr = base + WxReciveMessageCall;
     g_ret_addr       = g_target_addr + 5;
 
-    if (!Write5ByteJump(g_target_addr, (DWORD)&RecvMessageTrampoline)) {
+    if (!BuildRecvMessageTrampoline()) {
+        PostLog("接收消息 Hook: 分配 x64 跳板内存失败");
+        return false;
+    }
+
+    if (!Write5ByteJump(g_target_addr, reinterpret_cast<uintptr_t>(g_trampoline))) {
         PostLog("接收消息 Hook: 写入入口跳转失败");
         return false;
     }

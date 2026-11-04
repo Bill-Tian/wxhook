@@ -1,10 +1,10 @@
-name: Build wxhook DLL (x86)
+name: Build wxhook DLL (x64)
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, wx-3.9.12.57-x64 ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, wx-3.9.12.57-x64 ]
   workflow_dispatch:
 
 jobs:
@@ -21,21 +21,20 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build wxhook.dll (Win32 / x86)
+      - name: Build wxhook.dll (x64)
         run: |
           msbuild wxhook.sln `
             /p:Configuration=${{ matrix.configuration }} `
-            /p:Platform=x86 `
+            /p:Platform=x64 `
             /p:PlatformToolset=v143 `
             /m
 
       - name: Upload Artifact (${{ matrix.configuration }})
         uses: actions/upload-artifact@v4
         with:
-          name: wxhook-x86-${{ matrix.configuration }}
+          name: wxhook-x64-${{ matrix.configuration }}
           path: |
-            ${{ matrix.configuration }}/wxhook.dll
-            WxTools.exe
+            x64/${{ matrix.configuration }}/wxhook.dll
+            tools/inject_x64.py
             tools/receiver.py
           if-no-files-found: error
-

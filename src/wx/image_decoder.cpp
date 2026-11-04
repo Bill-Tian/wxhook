@@ -3,7 +3,7 @@
 #include "wechat.h"          // GetWeChatWinBase
 #include "http_client.h"     // PostLog
 #include "config.h"          // cfg::ENABLE_IMAGE_DECODE
-#include "wx_offsets.h"        // WxPatchAutoDownloadImage / WxPatchAutoDownloadVideo
+#include "wx_offsets.h"      // WxPatchAutoDownloadImage / WxPatchAutoDownloadVideo
 
 #include <fstream>
 #include <vector>
@@ -173,13 +173,15 @@ static void WorkerThread()
 
 void PatchAutoDownload()
 {
-    DWORD addr = GetWeChatWinBase() + WxPatchAutoDownloadImage;
+    uintptr_t addr = GetWeChatWinBase() + WxPatchAutoDownloadImage;
     DWORD oldProt = 0;
-    if (VirtualProtect((LPVOID)addr, 2, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        *(BYTE*)addr       = 0x6A;  // PUSH
-        *(BYTE*)(addr + 1) = 0x01;  // 1（原来是 00 = 不自动下载）
-        FlushInstructionCache(GetCurrentProcess(), (LPCVOID)addr, 2);
-        VirtualProtect((LPVOID)addr, 2, oldProt, &oldProt);
+    if (VirtualProtect(reinterpret_cast<LPVOID>(addr), 3, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        // x64: 将 45 33 C9 (xor r9d, r9d) 改为 41 B1 01 (mov r9b, 1)
+        *reinterpret_cast<BYTE*>(addr)     = 0x41;
+        *reinterpret_cast<BYTE*>(addr + 1) = 0xB1;
+        *reinterpret_cast<BYTE*>(addr + 2) = 0x01;
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), 3);
+        VirtualProtect(reinterpret_cast<LPVOID>(addr), 3, oldProt, &oldProt);
         PostLog("图片自动下载补丁: 已启用");
     } else {
         PostLog("图片自动下载补丁: VirtualProtect 失败");
@@ -188,13 +190,15 @@ void PatchAutoDownload()
 
 void PatchAutoDownloadVideo()
 {
-    DWORD addr = GetWeChatWinBase() + WxPatchAutoDownloadVideo;
+    uintptr_t addr = GetWeChatWinBase() + WxPatchAutoDownloadVideo;
     DWORD oldProt = 0;
-    if (VirtualProtect((LPVOID)addr, 2, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        *(BYTE*)addr       = 0x6A;
-        *(BYTE*)(addr + 1) = 0x01;
-        FlushInstructionCache(GetCurrentProcess(), (LPCVOID)addr, 2);
-        VirtualProtect((LPVOID)addr, 2, oldProt, &oldProt);
+    if (VirtualProtect(reinterpret_cast<LPVOID>(addr), 3, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        // x64: 将 45 33 C9 (xor r9d, r9d) 改为 41 B1 01 (mov r9b, 1)
+        *reinterpret_cast<BYTE*>(addr)     = 0x41;
+        *reinterpret_cast<BYTE*>(addr + 1) = 0xB1;
+        *reinterpret_cast<BYTE*>(addr + 2) = 0x01;
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), 3);
+        VirtualProtect(reinterpret_cast<LPVOID>(addr), 3, oldProt, &oldProt);
         PostLog("视频自动下载补丁: 已启用");
     } else {
         PostLog("视频自动下载补丁: VirtualProtect 失败");

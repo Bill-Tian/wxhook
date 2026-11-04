@@ -4,9 +4,9 @@
 
 ## 微信版本
 
-`3.9.12.56`（32 位）这是32位的最后一版，一年多没更新了
+`3.9.12.57`（64 位 / x64）
 
-> 不是很喜欢 4.0 版本的界面，本项目基于 3.9.12.56 开发。需要配置注册表绕过升级提醒,使用WxTools.exe启动微信，登录后注入 wxhook.dll。
+> 本分支 (`wx-3.9.12.57-x64`) 基于 64 位微信 `3.9.12.57` 开发。由于 `WxTools.exe` 为 32 位程序，64 位微信请使用 `python tools/inject_x64.py`（或任意 64 位 DLL 注入器）将 `x64\Debug\wxhook.dll` 或 `x64\Release\wxhook.dll` 注入 `WeChat.exe`。
 
 ### 绕过升级提醒
 
@@ -16,21 +16,23 @@
 计算机\HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers
 ```
 
-新建字符串值：
+新建字符串值（64 位微信默认安装在 `Program Files` 下，请按实际安装路径配置）：
 
 | 名称 | 数据 |
 |------|------|
-| `C:\Program Files (x86)\Tencent\WeChat\WeChat.exe` | `~ ARM64WOWONAMD64` |
+| `C:\Program Files\Tencent\WeChat\WeChat.exe` | `~ ARM64WOWONAMD64` |
 
 设置后微信将跳过版本检测，不再弹出升级提醒。
 
 ## 使用方式
 
-1. 将编译产出的 `wxhook.dll` 放到 WxTools.exe 同级目录下
-2. 使用 WxTools.exe 启动微信
-3. 微信登录成功后，在 WxTools.exe 中手动点击开始注入 `wxhook.dll`（使用其他注入工具也可以 原理都一样）
-4. 启动接收端：`python tools/receiver.py`
-5. 通过 HTTP 接口与微信交互
+1. 启动 64 位微信 `3.9.12.57`
+2. 启动接收端：`python tools/receiver.py`
+3. 使用 64 位 Python 注入编译产出的 `wxhook.dll`：
+   ```bash
+   python tools/inject_x64.py --dll x64\Release\wxhook.dll
+   ```
+4. 通过 HTTP 接口与微信交互
 
 ## 项目结构
 
@@ -99,7 +101,7 @@ wxhook/
 | 配置 | 默认值 | 说明 |
 |------|--------|------|
 | `HTTP_PORT` | 8888 | HTTP 服务端口 |
-| `EXPECTED_WX_VERSION` | 3.9.12.56 | 目标微信版本 |
+| `EXPECTED_WX_VERSION` | 3.9.12.57 | 目标微信版本 |
 | `LOG_PORT` / `MSG_PORT` | 9999 | receiver.py 监听端口 |
 | `ENABLE_HOOKS` | true | Hook 总开关 |
 | `ENABLE_IMAGE_DECODE` | true | 图片落盘解密 |
@@ -110,10 +112,10 @@ wxhook/
 ## 编译
 
 ```bash
-MSBuild wxhook.sln /p:Configuration=Debug /p:Platform=x86
+MSBuild wxhook.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-产出 `Debug\wxhook.dll`，通过注入工具加载到 WeChat.exe。
+产出 `x64\Release\wxhook.dll`（或 `x64\Debug\wxhook.dll`），通过 `python tools/inject_x64.py` 加载到 64 位 `WeChat.exe`。
 
 ## 接收端
 

@@ -2,8 +2,8 @@
 #include "self_info.h"
 #include "wechat.h"
 #include "http_client.h"      // PostLog
-#include "wx_offsets.h"        // WxID / WxCount / ... 偏移宏
-#include "json.hpp"            // nlohmann::json
+#include "wx_offsets.h"       // WxID / WxCount / ... 偏移宏
+#include "json.hpp"           // nlohmann::json
 
 #include <string>
 #include <cstring>
@@ -27,37 +27,31 @@ struct SelfInfoRaw {
     SelfInfoRaw() { memset(this, 0, sizeof(*this)); valid = false; }
 };
 
-// SEH 保护读取，避免单点崩溃导致整个微信进程退出
+// SEH 保护读取，避免单点崩溃导致整个微信进程退出（64位 MSVC std::string 兼容）
 bool ReadSelfInfoRaw(SelfInfoRaw& out) {
-    DWORD base = GetWeChatWinBase();
+    uintptr_t base = GetWeChatWinBase();
     if (!base) return false;
 
     __try {
-        // 微信号（为空时上层置 NULL）
-        sprintf_s(out.wxcount, "%s", (char*)(base + WxCount));
+        ReadWxStdStringPod(base + WxCount,       out.wxcount,     sizeof(out.wxcount));
+        ReadWxStdStringPod(base + WxID,          out.wxid,        sizeof(out.wxid));
+        ReadWxStdStringPod(base + WxNation,      out.nation,      sizeof(out.nation));
+        ReadWxStdStringPod(base + WxProvince,    out.province,    sizeof(out.province));
+        ReadWxStdStringPod(base + WxCity,        out.city,        sizeof(out.city));
+        ReadWxStdStringPod(base + WxPhoneNumber, out.phonenumber, sizeof(out.phonenumber));
+        ReadWxStdStringPod(base + WxNickName,    out.nickname,    sizeof(out.nickname));
 
-        // 微信ID：新老号兼容，长度不在 [0x6,0x14] 视为指针
-        sprintf_s(out.wxid, "%s", (char*)(base + WxID));
-        if (strlen(out.wxid) < 0x6 || strlen(out.wxid) > 0x14) {
-            sprintf_s(out.wxid, "%s", (char*)(*(DWORD*)(base + WxID)));
+        // 缓存目录（64 位 Unicode 指针）
+        const wchar_t* cache_ptr = *reinterpret_cast<const wchar_t**>(base + WxCacheDir);
+        if (cache_ptr) {
+            swprintf_s(out.cachedir, L"%s", cache_ptr);
         }
 
-        sprintf_s(out.nation,       "%s", (char*)(base + WxNation));
-        sprintf_s(out.province,     "%s", (char*)(base + WxProvince));
-        sprintf_s(out.city,        "%s", (char*)(base + WxCity));
-        sprintf_s(out.phonenumber, "%s", (char*)(base + WxPhoneNumber));
-
-        // 昵称：偏移 +0x14 处为 0xF 时按字符串读取，否则按指针解引用
-        if (*(DWORD*)(base + WxNickName + 0x14) == 0xF) {
-            sprintf_s(out.nickname, "%s", (char*)(base + WxNickName));
-        } else {
-            sprintf_s(out.nickname, "%s", (char*)(*(DWORD*)(base + WxNickName)));
+        DWORD sex = *reinterpret_cast<DWORD*>(base + WxSex);
+        if (sex != 1 && sex != 2) {
+            sex = *reinterpret_cast<DWORD*>(base + WxSexAlt);
         }
-
-        // 缓存目录（Unicode 指针）
-        swprintf_s(out.cachedir, L"%s", (wchar_t*)(*(DWORD*)(base + WxCacheDir)));
-
-        out.sex = *(DWORD*)(base + WxSex);
+        out.sex = sex;
         out.valid = true;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -99,7 +93,7 @@ std::string GetSelfInfoResponse() {
         return j.dump();
     }
 
-    // 字段字节按 UTF-8 处理（与 /utf-8 一致；参考示例用 UTF8ToUnicode 即说明源为 UTF-8）
+    // 字段字节按 UTF-8 处理
     json j;
     j["wxcount"]     = raw.wxcount[0] ? std::string(raw.wxcount) : std::string("NULL");
     j["wxid"]        = std::string(raw.wxid);
@@ -110,8 +104,8 @@ std::string GetSelfInfoResponse() {
     j["nickname"]    = std::string(raw.nickname);
     j["cachedir"]    = WideToUtf8(raw.cachedir);
     switch (raw.sex) {
-    case 1:  j["wxsex"] = "男";   break;
-    case 2:  j["wxsex"] = "女";   break;
+    case 1:  j["wxsex"] = "男";     break;
+    case 2:  j["wxsex"] = "女";     break;
     default: j["wxsex"] = "未设置"; break;
     }
 

@@ -1,10 +1,10 @@
 #include "pch.h"
 #include "qr_url.h"
-#include "wechat.h"        // GetWeChatWinBase
+#include "wechat.h"        // GetWeChatWinBase / ReadWxStdStringPod
 #include "http_client.h"   // PostLog
 #include "wx_offsets.h"    // WxQRUrlOffset
 #include "json.hpp"        // nlohmann::json
-#include "qrcodegen.hpp"    // Project Nayuki 二维码生成（单头库）
+#include "qrcodegen.hpp"   // Project Nayuki 二维码生成（单头库）
 
 #pragma warning(push)
 #pragma warning(disable: 4996)  // stb_image_write 内部使用 sprintf 等 CRT 函数
@@ -30,28 +30,23 @@ struct QRUrlRaw {
     QRUrlRaw() { memset(this, 0, sizeof(*this)); valid = false; }
 };
 
-// SEH 保护读取：偏移 0x436C398 处是 ASCII 字符串指针，解引用拿到后缀
+// SEH 保护读取：偏移 WxQRUrlOffset (0x5A30C28) 处是 MSVC x64 std::string
 // 空指针 / 长度异常（不在 [6, 80]）视为未生成二维码（登录后或残留数据）
 bool ReadQRUrlRaw(QRUrlRaw& out) {
-    DWORD base = GetWeChatWinBase();
+    uintptr_t base = GetWeChatWinBase();
     if (!base) return false;
 
-    __try {
-        char* p = *(char**)(base + WxQRUrlOffset);
-        if (p) {
-            sprintf_s(out.suffix, "%s", p);
-        }
-        // 合理性校验：长度异常视为未生成（防残留垃圾数据）
-        size_t len = strlen(out.suffix);
-        if (len < 0x6 || len > 0x80) {
-            out.suffix[0] = 0;
-        }
-        out.valid = true;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (!ReadWxStdStringPod(base + WxQRUrlOffset, out.suffix, sizeof(out.suffix))) {
         out.valid = false;
         return false;
     }
+
+    size_t len = strlen(out.suffix);
+    if (len < 0x6 || len > 0x80) {
+        out.suffix[0] = 0;
+    }
+    out.valid = true;
+    return true;
 }
 
 // 生成二维码 PNG 并保存到 path（POD 层不做文件 I/O，仅对象层调用 stb）
@@ -62,8 +57,8 @@ bool GenerateQRCodePng(const std::string& url, const std::string& path) {
         qrcodegen::QrCode qr = qrcodegen::QrCode::encodeText(url.c_str(), qrcodegen::QrCode::Ecc::MEDIUM);
         const int qr_size  = qr.getSize();
         const int scale    = 8;
-        const int border    = 4 * scale;
-        const int img_size  = qr_size * scale + border * 2;
+        const int border   = 4 * scale;
+        const int img_size = qr_size * scale + border * 2;
 
         std::vector<unsigned char> img((size_t)img_size * img_size * 3, 255);
         for (int y = 0; y < qr_size; y++) {

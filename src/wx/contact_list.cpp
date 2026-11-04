@@ -3,14 +3,16 @@
 #include "wechat.h"          // GetWeChatWinBase / GetLoginState / WideToUtf8
 #include "http_client.h"     // PostLog
 #include "json.hpp"          // nlohmann::json
+#include "wx_offsets.h"      // WxGetServiceMgr / WxGetContactList / Contact*
 
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdint>
 
 using json = nlohmann::json;
 
-// ── 微信内部字符串结构（参考 send_msg.cpp 的 WeChatString）──────
+// ── 微信内部字符串结构（x64 布局）──────
 struct WxString {
     wchar_t* ptr;
     int      length;
@@ -22,33 +24,12 @@ struct Contact {
     WxString wxid;            // 微信ID/群ID
     WxString custom_account;  // 微信号
     WxString encrypt_name;    // 昵称（微信内部字段名）
-    WxString pinyin_all;      // 备注（微信内部字段名）
+    WxString remark;          // 备注
+    WxString pinyin_all;      // 备注备选字段
     DWORD    del_flag;        // 删除标志
     DWORD    type;            // 联系人类型
     DWORD    verify_flag;     // 验证标志
 };
-
-// ── 获取好友列表所需的偏移（参考 doc/获取好友列表.txt，wx_offsets.h 中无）──
-#define WxGetServiceMgr     0x1188ff0   // 获取微信服务管理器（同 send_msg.cpp 的 WxSendMessageMgr）
-#define WxGetContactList     0x16b1b10   // 获取联系人列表
-
-// 微信内部 Contact 节点内存布局（每个节点 0x450 字节）
-#define ContactNodeSize           0x450
-#define ContactWxidPtr            0x10
-#define ContactWxidLen            0x14
-#define ContactWxidMax            0x18
-#define ContactCustomAccountPtr   0x24
-#define ContactCustomAccountLen   0x28
-#define ContactCustomAccountMax   0x2C
-#define ContactEncryptNamePtr     0x6C
-#define ContactEncryptNameLen     0x70
-#define ContactEncryptNameMax     0x74
-#define ContactPinyinAllPtr       0xEC
-#define ContactPinyinAllLen       0xF0
-#define ContactPinyinAllMax       0xF4
-#define ContactDelFlag             0x4C
-#define ContactType                0x50
-#define ContactVerifyFlag         0x54
 
 // ── 线程安全：微信联系人函数非线程安全，HTTP 并发请求需加锁 ─────────
 static CRITICAL_SECTION g_contact_cs;
@@ -57,49 +38,62 @@ static bool g_contact_cs_init = []() {
     return true;
 }();
 
-// ── POD 函数：调用微信内部获取联系人列表（内联汇编）──────────────
-// 不能含 C++ 析构对象（否则 MSVC 报 C2712 不允许 __asm）
-// 输出 contact[0]=start, contact[2]=end，调用者遍历 [start, end)
-static int GetAllContactInternal(DWORD* out_start, DWORD* out_end) {
-    DWORD get_instance      = GetWeChatWinBase() + WxGetServiceMgr;
-    DWORD contact_get_list = GetWeChatWinBase() + WxGetContactList;
-    DWORD* contact[3] = { 0, 0, 0 };
+// ── POD 函数：调用微信内部获取联系人列表（x64 函数指针）──────────────
+// 输出 contact[0]=start, contact[1]=end, contact[2]=cap，调用者遍历 [start, end)
+static int GetAllContactInternal(uintptr_t* out_start, uintptr_t* out_end) {
+    uintptr_t base = GetWeChatWinBase();
+    if (!base) return 0;
+
+    using GetServiceMgrFn  = uintptr_t(__fastcall*)();
+    using GetContactListFn = uint8_t(__fastcall*)(uintptr_t mgr, uintptr_t* out_vector);
+
+    auto get_instance     = reinterpret_cast<GetServiceMgrFn>(base + WxGetServiceMgr);
+    auto contact_get_list = reinterpret_cast<GetContactListFn>(base + WxGetContactList);
+
+    uintptr_t contact[3] = { 0, 0, 0 };
     int success = 0;
-    __asm {
-        PUSHAD
-        CALL       get_instance
-        LEA        ECX, contact
-        PUSH       ECX
-        MOV        ECX, EAX
-        CALL       contact_get_list
-        MOVZX      EAX, AL
-        MOV        success, EAX
-        POPAD
+
+    __try {
+        uintptr_t mgr = get_instance();
+        uint8_t ret = contact_get_list(mgr, contact);
+        success = static_cast<int>(ret);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
     }
-    if (out_start) *out_start = (DWORD)contact[0];
-    if (out_end)   *out_end   = (DWORD)contact[2];
+
+    if (out_start) *out_start = contact[0];
+    // MSVC x64 std::vector: [0]=_Myfirst, [1]=_Mylast, [2]=_Myend
+    if (out_end)   *out_end   = (contact[1] != 0) ? contact[1] : contact[2];
     return success;
 }
 
-// ── POD 函数：SEH 保护读取单个联系人节点 ─────────────────────────
+// ── POD 函数：SEH 保护读取单个联系人节点（64-bit 偏移）─────────────────
 // 返回 true 表示成功读取，false 表示内存访问异常
-static bool ReadContactNodeSEH(DWORD node_addr, Contact* out) {
+static bool ReadContactNodeSEH(uintptr_t node_addr, Contact* out) {
     __try {
-        out->wxid.ptr           = *(wchar_t**)(node_addr + ContactWxidPtr);
-        out->wxid.length        = *(DWORD*)(node_addr + ContactWxidLen);
-        out->wxid.max_length    = *(DWORD*)(node_addr + ContactWxidMax);
-        out->custom_account.ptr = *(wchar_t**)(node_addr + ContactCustomAccountPtr);
-        out->custom_account.length      = *(DWORD*)(node_addr + ContactCustomAccountLen);
-        out->custom_account.max_length  = *(DWORD*)(node_addr + ContactCustomAccountMax);
-        out->encrypt_name.ptr   = *(wchar_t**)(node_addr + ContactEncryptNamePtr);
-        out->encrypt_name.length       = *(DWORD*)(node_addr + ContactEncryptNameLen);
-        out->encrypt_name.max_length   = *(DWORD*)(node_addr + ContactEncryptNameMax);
-        out->pinyin_all.ptr     = *(wchar_t**)(node_addr + ContactPinyinAllPtr);
-        out->pinyin_all.length         = *(DWORD*)(node_addr + ContactPinyinAllLen);
-        out->pinyin_all.max_length     = *(DWORD*)(node_addr + ContactPinyinAllMax);
-        out->del_flag           = *(DWORD*)(node_addr + ContactDelFlag);
-        out->type               = *(DWORD*)(node_addr + ContactType);
-        out->verify_flag        = *(DWORD*)(node_addr + ContactVerifyFlag);
+        out->wxid.ptr                  = *reinterpret_cast<wchar_t**>(node_addr + ContactWxidPtr);
+        out->wxid.length               = *reinterpret_cast<int*>(node_addr + ContactWxidLen);
+        out->wxid.max_length           = *reinterpret_cast<int*>(node_addr + ContactWxidMax);
+
+        out->custom_account.ptr        = *reinterpret_cast<wchar_t**>(node_addr + ContactCustomAccountPtr);
+        out->custom_account.length     = *reinterpret_cast<int*>(node_addr + ContactCustomAccountLen);
+        out->custom_account.max_length = *reinterpret_cast<int*>(node_addr + ContactCustomAccountMax);
+
+        out->remark.ptr                = *reinterpret_cast<wchar_t**>(node_addr + ContactRemarkPtr);
+        out->remark.length             = *reinterpret_cast<int*>(node_addr + ContactRemarkLen);
+        out->remark.max_length         = *reinterpret_cast<int*>(node_addr + ContactRemarkMax);
+
+        out->encrypt_name.ptr          = *reinterpret_cast<wchar_t**>(node_addr + ContactEncryptNamePtr);
+        out->encrypt_name.length       = *reinterpret_cast<int*>(node_addr + ContactEncryptNameLen);
+        out->encrypt_name.max_length   = *reinterpret_cast<int*>(node_addr + ContactEncryptNameMax);
+
+        out->pinyin_all.ptr            = *reinterpret_cast<wchar_t**>(node_addr + ContactPinyinAllPtr);
+        out->pinyin_all.length         = *reinterpret_cast<int*>(node_addr + ContactPinyinAllLen);
+        out->pinyin_all.max_length     = *reinterpret_cast<int*>(node_addr + ContactPinyinAllMax);
+
+        out->del_flag                  = *reinterpret_cast<DWORD*>(node_addr + ContactDelFlag);
+        out->type                      = *reinterpret_cast<DWORD*>(node_addr + ContactType);
+        out->verify_flag               = *reinterpret_cast<DWORD*>(node_addr + ContactVerifyFlag);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -108,9 +102,9 @@ static bool ReadContactNodeSEH(DWORD node_addr, Contact* out) {
 
 // ── 对象层：循环读取联系人到 vector ──────────────────────────────
 // 单节点读取失败则停止遍历，已读部分仍可返回（容错降级）
-static void ReadContactsToVector(DWORD start, DWORD end, std::vector<Contact>& vec) {
-    while (start < end) {
-        Contact temp = { 0 };
+static void ReadContactsToVector(uintptr_t start, uintptr_t end, std::vector<Contact>& vec) {
+    while (start + ContactNodeSize <= end) {
+        Contact temp = {};
         if (!ReadContactNodeSEH(start, &temp)) {
             PostLog("获取好友列表: 读取节点异常 offset=" + std::to_string(start));
             break;
@@ -143,7 +137,7 @@ std::string GetContactListResponse() {
     }
 
     // 2) 加锁调用微信获取联系人列表
-    DWORD start = 0, end = 0;
+    uintptr_t start = 0, end = 0;
     int success = 0;
     {
         EnterCriticalSection(&g_contact_cs);
@@ -189,7 +183,11 @@ std::string GetContactListResponse() {
                 item["remark"]  = "";
             } else {
                 item["wxcount"] = SafeWxToUtf8(c.custom_account);
-                item["remark"]  = SafeWxToUtf8(c.pinyin_all);
+                std::string remark = SafeWxToUtf8(c.pinyin_all);
+                if (remark.empty()) {
+                    remark = SafeWxToUtf8(c.remark);
+                }
+                item["remark"]  = remark;
             }
             result_json.push_back(item);
         }
@@ -200,7 +198,7 @@ std::string GetContactListResponse() {
     j["code"]   = 0;
     j["msg"]    = "ok";
     j["count"]  = vec.size();
-    j["result"]  = result_json;
+    j["result"] = result_json;
 
     std::string data;
     try {
