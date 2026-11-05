@@ -180,11 +180,24 @@ std::string GetContactListResponse() {
             std::string wxid = SafeWxToUtf8(c.wxid);
 
             json item;
-            item["wxid"]     = wxid;
-            item["nickname"] = SafeWxToUtf8(c.encrypt_name);
+            item["wxid"]        = wxid;
+            item["nickname"]    = SafeWxToUtf8(c.encrypt_name);
+            item["type"]        = c.type;
+            item["verify_flag"] = c.verify_flag;
+
+            // 系统内置账号
+            bool is_system = (wxid == "filehelper" || wxid == "fmessage" ||
+                              wxid == "floatbottle" || wxid == "medianote" ||
+                              wxid == "newsapp" || wxid == "qmessage" ||
+                              wxid == "qqmail" || wxid == "tmessage");
+            bool is_chatroom = (wxid.find("@chatroom") != std::string::npos);
+
+            // 公众号判断：认证标志非0 或 gh_ 开头，且非群聊非系统号
+            item["is_official"] = !is_system && !is_chatroom &&
+                                  (c.verify_flag != 0 || wxid.rfind("gh_", 0) == 0);
 
             // 群聊（@chatroom）：wxcount/remark 为空
-            if (wxid.find("@chatroom") != std::string::npos) {
+            if (is_chatroom) {
                 item["wxcount"] = "";
                 item["remark"]  = "";
             } else {
